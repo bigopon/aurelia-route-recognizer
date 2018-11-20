@@ -17,6 +17,7 @@ export class RouteRecognizer {
   constructor() {
     this.rootState = new State();
     this.names = {};
+    this.routes = new Map();
   }
 
   /**
@@ -31,12 +32,12 @@ export class RouteRecognizer {
     }
 
     let currentState = this.rootState;
+    let skippableStates = [];
     let regex = '^';
     let types = { statics: 0, dynamics: 0, stars: 0 };
     let names = [];
     let routeName = route.handler.name;
     let isEmpty = true;
-    let isAllOptional = true;
     let segments = parse(route.path, names, types, route.caseSensitive);
 
     for (let i = 0, ii = segments.length; i < ii; i++) {
@@ -45,37 +46,57 @@ export class RouteRecognizer {
         continue;
       }
 
-      isEmpty = false;
-      isAllOptional = isAllOptional && segment.optional;
-
       // Add a representation of the segment to the NFA and regex
-      currentState = addSegment(currentState, segment);
-      regex += segment.optional ? '/?' : '/';
-      regex += segment.regex();
+      let [firstState, nextState] = addSegment(currentState, segment);
+
+      // add the first part of the next segment to the end of any skipped states
+      for (let j = 0, jj = skippableStates.length; j < jj; j++) {
+        skippableStates[j].nextStates.push(firstState);
+      }
+
+      // If the segment was optional we don't fast forward to the end of the
+      // segment, but we do hold on to a reference to the end of the segment
+      // for adding future segments. Multiple consecutive optional segments
+      // will accumulate.
+      if (segment.optional) {
+        skippableStates.push(nextState);
+        regex += `(?:/${segment.regex()})?`;
+
+      // Otherwise, we fast forward to the end of the segment and remove any
+      // references to skipped segments since we don't need them anymore.
+      } else {
+        currentState = nextState;
+        regex += `/${segment.regex()}`;
+        skippableStates.length = 0;
+        isEmpty = false;
+      }
     }
 
-    if (isAllOptional) {
-      if (isEmpty) {
-        currentState = currentState.put({ validChars: '/' });
-        regex += '/';
-      } else {
-        let finalState = this.rootState.put({ validChars: '/' });
-        currentState.epsilon = [ finalState ];
-        currentState = finalState;
-        // Regex is ok because the first '/?' will match.
-      }
+    // An "all optional" path is technically empty since currentState is this.rootState
+    if (isEmpty) {
+      currentState = currentState.put({ validChars: '/' });
+      regex += '/?';
     }
 
     let handlers = [{ handler: route.handler, names: names }];
 
+    this.routes.set(route.handler, { segments, handlers });
     if (routeName) {
       let routeNames = Array.isArray(routeName) ? routeName : [routeName];
       for (let i = 0; i < routeNames.length; i++) {
-        this.names[routeNames[i]] = {
-          segments: segments,
-          handlers: handlers
-        };
+        if (!(routeNames[i] in this.names)) {
+          this.names[routeNames[i]] = { segments, handlers };
+        }
       }
+    }
+
+    // Any trailing skipped states need to be endpoints and need to have
+    // handlers attached.
+    for (let i = 0; i < skippableStates.length; i++) {
+      let state = skippableStates[i];
+      state.handlers = handlers;
+      state.regex = new RegExp(regex + '$', route.caseSensitive ? '' : 'i');
+      state.types = types;
     }
 
     currentState.handlers = handlers;
@@ -86,42 +107,52 @@ export class RouteRecognizer {
   }
 
   /**
-  * Retrieve the handlers registered for the named route.
+  * Retrieve a RouteGenerator for a route by name or RouteConfig (RouteHandler).
   *
-  * @param name The name of the route.
+  * @param nameOrRoute The name of the route or RouteConfig object.
+  * @returns The RouteGenerator for that route.
+  */
+  getRoute(nameOrRoute: string | RouteHandler): RouteGenerator {
+    return typeof(nameOrRoute) === 'string' ? this.names[nameOrRoute] : this.routes.get(nameOrRoute);
+  }
+
+  /**
+  * Retrieve the handlers registered for the route by name or RouteConfig (RouteHandler).
+  *
+  * @param nameOrRoute The name of the route or RouteConfig object.
   * @returns The handlers.
   */
-  handlersFor(name: string): HandlerEntry[] {
-    let route = this.names[name];
+  handlersFor(nameOrRoute: string | RouteHandler): HandlerEntry[] {
+    let route = this.getRoute(nameOrRoute);
     if (!route) {
-      throw new Error(`There is no route named ${name}`);
+      throw new Error(`There is no route named ${nameOrRoute}`);
     }
 
     return [...route.handlers];
   }
 
   /**
-  * Check if this RouteRecognizer recognizes a named route.
+  * Check if this RouteRecognizer recognizes a route by name or RouteConfig (RouteHandler).
   *
-  * @param name The name of the route.
+  * @param nameOrRoute The name of the route or RouteConfig object.
   * @returns True if the named route is recognized.
   */
-  hasRoute(name: string): boolean {
-    return !!this.names[name];
+  hasRoute(nameOrRoute: string | RouteHandler): boolean {
+    return !!this.getRoute(nameOrRoute);
   }
 
   /**
-  * Generate a path and query string from a route name and params object.
+  * Generate a path and query string from a route name or RouteConfig (RouteHandler) and params object.
   *
-  * @param name The name of the route.
+  * @param nameOrRoute The name of the route or RouteConfig object.
   * @param params The route params to use when populating the pattern.
   *  Properties not required by the pattern will be appended to the query string.
   * @returns The generated absolute path and query string.
   */
-  generate(name: string, params: Object): string {
-    let route = this.names[name];
+  generate(nameOrRoute: string | RouteHandler, params: object): string {
+    let route = this.getRoute(nameOrRoute);
     if (!route) {
-      throw new Error(`There is no route named ${name}`);
+      throw new Error(`There is no route named ${nameOrRoute}`);
     }
 
     let handler = route.handlers[0].handler;
@@ -144,7 +175,7 @@ export class RouteRecognizer {
       let segmentValue = segment.generate(routeParams, consumed);
       if (segmentValue === null || segmentValue === undefined) {
         if (!segment.optional) {
-          throw new Error(`A value is required for route parameter '${segment.name}' in route '${name}'.`);
+          throw new Error(`A value is required for route parameter '${segment.name}' in route '${nameOrRoute}'.`);
         }
       } else {
         output += '/';
@@ -175,7 +206,7 @@ export class RouteRecognizer {
   *  `isDynanic` values for the matched route(s), or undefined if no match
   *  was found.
   */
-  recognize(path: string): RecognizedRoute[] | undefined {
+  recognize(path: string): RecognizeResults {
     let states = [this.rootState];
     let queryParams = {};
     let isSlashDropped = false;
@@ -328,16 +359,6 @@ function recognizeChar(states, ch) {
     nextStates.push(...state.match(ch));
   }
 
-  let skippableStates = nextStates.filter(s => s.epsilon);
-  while (skippableStates.length > 0) {
-    let newStates = [];
-    skippableStates.forEach(s => {
-      nextStates.push(...s.epsilon);
-      newStates.push(...s.epsilon);
-    });
-    skippableStates = newStates.filter(s => s.epsilon);
-  }
-
   return nextStates;
 }
 
@@ -364,15 +385,11 @@ function findHandler(state, path, queryParams) {
 }
 
 function addSegment(currentState, segment) {
-  let state = currentState.put({ validChars: '/' });
+  let firstState = currentState.put({ validChars: '/' });
+  let nextState = firstState;
   segment.eachChar(ch => {
-    state = state.put(ch);
+    nextState = nextState.put(ch);
   });
 
-  if (segment.optional) {
-    currentState.epsilon = currentState.epsilon || [];
-    currentState.epsilon.push(state);
-  }
-
-  return state;
+  return [firstState, nextState];
 }

@@ -122,7 +122,7 @@ export var DynamicSegment = function () {
   };
 
   DynamicSegment.prototype.regex = function regex() {
-    return this.optional ? '([^/]+)?' : '([^/]+)';
+    return '([^/]+)';
   };
 
   DynamicSegment.prototype.generate = function generate(params, consumed) {
@@ -180,6 +180,7 @@ export var RouteRecognizer = function () {
 
     this.rootState = new State();
     this.names = {};
+    this.routes = new Map();
   }
 
   RouteRecognizer.prototype.add = function add(route) {
@@ -193,12 +194,12 @@ export var RouteRecognizer = function () {
     }
 
     var currentState = this.rootState;
+    var skippableStates = [];
     var regex = '^';
     var types = { statics: 0, dynamics: 0, stars: 0 };
     var names = [];
     var routeName = route.handler.name;
     var isEmpty = true;
-    var isAllOptional = true;
     var segments = parse(route.path, names, types, route.caseSensitive);
 
     for (var i = 0, ii = segments.length; i < ii; i++) {
@@ -207,35 +208,47 @@ export var RouteRecognizer = function () {
         continue;
       }
 
-      isEmpty = false;
-      isAllOptional = isAllOptional && segment.optional;
+      var _addSegment = addSegment(currentState, segment),
+          firstState = _addSegment[0],
+          nextState = _addSegment[1];
 
-      currentState = addSegment(currentState, segment);
-      regex += segment.optional ? '/?' : '/';
-      regex += segment.regex();
+      for (var j = 0, jj = skippableStates.length; j < jj; j++) {
+        skippableStates[j].nextStates.push(firstState);
+      }
+
+      if (segment.optional) {
+        skippableStates.push(nextState);
+        regex += '(?:/' + segment.regex() + ')?';
+      } else {
+        currentState = nextState;
+        regex += '/' + segment.regex();
+        skippableStates.length = 0;
+        isEmpty = false;
+      }
     }
 
-    if (isAllOptional) {
-      if (isEmpty) {
-        currentState = currentState.put({ validChars: '/' });
-        regex += '/';
-      } else {
-        var finalState = this.rootState.put({ validChars: '/' });
-        currentState.epsilon = [finalState];
-        currentState = finalState;
-      }
+    if (isEmpty) {
+      currentState = currentState.put({ validChars: '/' });
+      regex += '/?';
     }
 
     var handlers = [{ handler: route.handler, names: names }];
 
+    this.routes.set(route.handler, { segments: segments, handlers: handlers });
     if (routeName) {
       var routeNames = Array.isArray(routeName) ? routeName : [routeName];
       for (var _i2 = 0; _i2 < routeNames.length; _i2++) {
-        this.names[routeNames[_i2]] = {
-          segments: segments,
-          handlers: handlers
-        };
+        if (!(routeNames[_i2] in this.names)) {
+          this.names[routeNames[_i2]] = { segments: segments, handlers: handlers };
+        }
       }
+    }
+
+    for (var _i3 = 0; _i3 < skippableStates.length; _i3++) {
+      var state = skippableStates[_i3];
+      state.handlers = handlers;
+      state.regex = new RegExp(regex + '$', route.caseSensitive ? '' : 'i');
+      state.types = types;
     }
 
     currentState.handlers = handlers;
@@ -245,23 +258,27 @@ export var RouteRecognizer = function () {
     return currentState;
   };
 
-  RouteRecognizer.prototype.handlersFor = function handlersFor(name) {
-    var route = this.names[name];
+  RouteRecognizer.prototype.getRoute = function getRoute(nameOrRoute) {
+    return typeof nameOrRoute === 'string' ? this.names[nameOrRoute] : this.routes.get(nameOrRoute);
+  };
+
+  RouteRecognizer.prototype.handlersFor = function handlersFor(nameOrRoute) {
+    var route = this.getRoute(nameOrRoute);
     if (!route) {
-      throw new Error('There is no route named ' + name);
+      throw new Error('There is no route named ' + nameOrRoute);
     }
 
     return [].concat(route.handlers);
   };
 
-  RouteRecognizer.prototype.hasRoute = function hasRoute(name) {
-    return !!this.names[name];
+  RouteRecognizer.prototype.hasRoute = function hasRoute(nameOrRoute) {
+    return !!this.getRoute(nameOrRoute);
   };
 
-  RouteRecognizer.prototype.generate = function generate(name, params) {
-    var route = this.names[name];
+  RouteRecognizer.prototype.generate = function generate(nameOrRoute, params) {
+    var route = this.getRoute(nameOrRoute);
     if (!route) {
-      throw new Error('There is no route named ' + name);
+      throw new Error('There is no route named ' + nameOrRoute);
     }
 
     var handler = route.handlers[0].handler;
@@ -284,7 +301,7 @@ export var RouteRecognizer = function () {
       var segmentValue = segment.generate(routeParams, consumed);
       if (segmentValue === null || segmentValue === undefined) {
         if (!segment.optional) {
-          throw new Error('A value is required for route parameter \'' + segment.name + '\' in route \'' + name + '\'.');
+          throw new Error('A value is required for route parameter \'' + segment.name + '\' in route \'' + nameOrRoute + '\'.');
         }
       } else {
         output += '/';
@@ -339,9 +356,9 @@ export var RouteRecognizer = function () {
     }
 
     var solutions = [];
-    for (var _i3 = 0, _l = states.length; _i3 < _l; _i3++) {
-      if (states[_i3].handlers) {
-        solutions.push(states[_i3]);
+    for (var _i4 = 0, _l = states.length; _i4 < _l; _i4++) {
+      if (states[_i4].handlers) {
+        solutions.push(states[_i4]);
       }
     }
 
@@ -448,25 +465,6 @@ function recognizeChar(states, ch) {
     nextStates.push.apply(nextStates, state.match(ch));
   }
 
-  var skippableStates = nextStates.filter(function (s) {
-    return s.epsilon;
-  });
-
-  var _loop = function _loop() {
-    var newStates = [];
-    skippableStates.forEach(function (s) {
-      nextStates.push.apply(nextStates, s.epsilon);
-      newStates.push.apply(newStates, s.epsilon);
-    });
-    skippableStates = newStates.filter(function (s) {
-      return s.epsilon;
-    });
-  };
-
-  while (skippableStates.length > 0) {
-    _loop();
-  }
-
   return nextStates;
 }
 
@@ -493,15 +491,11 @@ function findHandler(state, path, queryParams) {
 }
 
 function addSegment(currentState, segment) {
-  var state = currentState.put({ validChars: '/' });
+  var firstState = currentState.put({ validChars: '/' });
+  var nextState = firstState;
   segment.eachChar(function (ch) {
-    state = state.put(ch);
+    nextState = nextState.put(ch);
   });
 
-  if (segment.optional) {
-    currentState.epsilon = currentState.epsilon || [];
-    currentState.epsilon.push(state);
-  }
-
-  return state;
+  return [firstState, nextState];
 }
